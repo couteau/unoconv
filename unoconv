@@ -24,6 +24,7 @@ import signal
 import subprocess
 import sys
 import time
+import tempfile
 
 __version__ = '0.8.2'
 
@@ -576,6 +577,10 @@ class Options:
         self.preserve = False
         self.server = '127.0.0.1'
         self.setprinter = False
+        self.sheetname = None
+        self.sheetnumber = 0
+        self.sheetheader = False
+        self.splitsheets = False
         self.showlist = False
         self.stdin = False
         self.stdout = False
@@ -588,11 +593,12 @@ class Options:
 
         # Get options from the commandline
         try:
-            opts, args = getopt.getopt(args, 'c:Dd:e:F:f:hi:I:LlM:no:p:s:T:t:P:vV',
+            opts, args = getopt.getopt(args, 'c:Dd:e:F:f:hi:I:LlM:N:no:p:S:s:T:t:P:vV',
                 ['disable-html-update-links', 'connection=', 'debug', 'doctype=', 'export=', 'field=', 'format=',
                  'help', 'import=', 'import-filter-name=', 'listener', 'meta=', 'no-launch',
                  'output=', 'outputpath', 'password=', 'pipe=', 'port=', 'preserve',
-                 'server=', 'timeout=', 'user-profile=', 'show', 'stdin',
+                 'server=', 'timeout=', 'user-profile=', 'show', 'sheetname=', 'sheetnumber=', 
+                 'sheetheader', 'splitsheets', 'stdin',
                  'stdout', 'template', 'printer=', 'unsafe-quiet-update', 'verbose', 'version'])
         except getopt.error as exc:
             print('unoconv: %s, try unoconv -h for a list of all the options' % str(exc))
@@ -673,6 +679,23 @@ class Options:
                 self.preserve = True
             elif opt in ['-s', '--server']:
                 self.server = arg
+            elif opt in ['-S', '--sheetname']:
+                self.sheetname = arg
+            elif opt in ['-N', '--sheetnumber']:
+                if arg == 'all':
+                    self.sheetnumber = arg
+                elif ',' in arg or '-' in arg:
+                    self.sheetnumber = []
+                    for part in arg.split(','):
+                        if '-' in part:
+                            a, b = map(int, part.split('-'))
+                            self.sheetnumber.extend(range(a, b + 1))
+                        else:
+                            self.sheetnumber.append(int(part))
+            elif opt in ['--sheetheader']:
+                self.sheetheader = True
+            elif opt in ['--splitsheets']:
+                self.splitsheets = True
             elif opt in ['--show']:
                 self.showlist = True
             elif opt in ['--stdin']:
@@ -801,6 +824,10 @@ unoconv options:
       --preserve                      keep timestamp and permissions of the original document
   -s, --server=server                 specify the server address (default: 127.0.0.1)
                                         to be used by client or listener
+  -S  --sheetname=name                specify the name of the worksheet of a spreadsheet file to be converted to csv
+  -N  --sheetnumber=number/"all"      specify the number(s) of the worksheets to be converted to csv or "all" for all worksheets
+      --sheetheader                   when converting multiple sheets to csv, output the name of each sheet at the beginning of each sheet
+      --splitsheets                   when converting multiple sheets to csv, place each converted sheet in a separate file
       --show                          list the available output formats
       --stdin                         read from stdin (filenames are ignored if provided)
       --stdout                        write output to stdout
@@ -1167,7 +1194,72 @@ class Convertor:
             info(1, "Output file: %s" % outputurl)
 
             try:
-                document.storeToURL(outputurl, tuple(outputprops))
+                # if converting spreadsheet to csv, handle special options sheetname, sheetnumber, sheetheader, splitsheets,
+                if outputfmt.filter == 'Text - txt - csv (StarCalc)' and (op.sheetnumber == 'all' or type(op.sheetnumber) == list):
+                    files = []
+                    if type(op.sheetnumber) == list:
+                        sheets = []
+                        for n in op.sheetnumber:
+                            if n > document.Sheets.Count:
+                                raise UnoException("Unable to convert sheet %d of %s: sheetnumber exceeds number of sheets in document" % (i, inputfn), None)
+                            sheets.append(document.Sheets[n-1])
+                    else:
+                        sheets = document.Sheets
+                    for i,sheet in enumerate(sheets):
+                        document.Sheets.moveByName(sheet.Name, 0)
+                        # if export is to stdout, we don't ned to worry about whether we are splitting or combining sheets 
+                        if not op.stdout:
+                            if op.splitsheets:
+                                if type(op.sheetnumber) == list:
+                                    suffix = op.sheetnumber[i]
+                                else:
+                                    suffix = i+1
+                                if not op.output:
+                                    sheetoutputfn = os.path.splitext(outputfn)[0] + "-" + str(suffix) + os.extsep + outputfmt.extension
+
+                                else:
+                                    if op.output.endswith(os.pathsep):
+                                        sheetoutputfn = realpath(op.output, os.path.basename(outputfn) + "-" + str(suffix) + os.extsep + outputfmt.extension)
+                                    else:
+                                        sheetoutputfn = realpath(os.path.dirname(op.output), os.path.basename(op.output) + "-" + str(suffix) + os.extsep + outputfmt.extension)
+                                outputurl = unohelper.absolutize( self.cwd, unohelper.systemPathToFileUrl(sheetoutputfn))
+                            else:
+                                (handle,filename) = tempfile.mkstemp()
+                                if op.sheetheader:
+                                    os.write(handle, sheet.Name + '\n\n')
+                                os.close(handle)
+                                outputurl = unohelper.absolutize(self.cwd, unohelper.systemPathToFileUrl(filename))
+                                files.append(filename)
+                        else:
+                            # going to stdout--write sheetname header (but for consistency with other output destinations, skip it if splitting sheets)
+                            if not op.splitsheets and op.sheetheader:
+                                os.write(handle, sheet.Name + '\n\n')
+
+                        document.storeToURL(outputurl, tuple(outputprops))
+
+                    # if combining sheets and not going to standard out, write all the temp files to the final output file
+                    if not op.splitsheets and not op.stdout:
+                        with open(outputfn, "w") as outfile:
+                            for f in files:
+                                with open(f, "r") as infile:
+                                    outfile.write(infile.read())
+                                    outfile.write("\n")
+                                os.remove(f)
+                else:
+                    if op.sheetname != None:
+                        try:
+                            document.Sheets.moveByName(op.sheetname, 0)
+                        except:
+                            raise UnoException("Unable to convert sheet %s of %s: sheet not found" % (op.sheetname, inputfn), None)
+                    elif op.sheetnumber > 1:
+                        sheets = document.Sheets
+                        if op.sheetnumber > sheets.Count:
+                            raise UnoException("Unable to convert sheet %d of %s: sheetnumber exceeds number of sheets in document" % (op.sheetnumber, inputfn), None)
+                        sheetnames = list(sheets.getElementNames())
+                        if op.sheetnumber <= len(sheetnames):
+                            sheets.moveByName(sheetnames[op.sheetnumber-1], 0)
+
+                    document.storeToURL(outputurl, tuple(outputprops))
             except IOException as e:
                 raise UnoException("Unable to store document to %s (Error %s)\n\nProperties: %s" % (outputurl, e.value, outputprops), None)
 
